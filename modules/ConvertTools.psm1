@@ -3,11 +3,29 @@ function Test-ImportExcelDependency {
         throw @"
 ImportExcel PowerShell module is required for XLSX conversions.
 
-Install it using:
+Install it for the current user with:
 
 Install-Module ImportExcel -Scope CurrentUser
+
+Administrator access is not required.
 "@
     }
+}
+
+function Test-YamlDependency {
+    if (!(Get-Module -ListAvailable -Name powershell-yaml)) {
+        throw @"
+powershell-yaml PowerShell module is required for YAML conversions.
+
+Install it for the current user with:
+
+Install-Module powershell-yaml -Scope CurrentUser
+
+Administrator access is not required.
+"@
+    }
+
+    Import-Module powershell-yaml -ErrorAction Stop
 }
 
 function Resolve-InputFilePath {
@@ -27,77 +45,258 @@ function Resolve-InputFilePath {
     return $ResolvedPath
 }
 
-function New-OutputFilePath {
+function Get-NormalizedFormat {
+    param([Parameter(Mandatory = $true)][string]$Format)
+
+    return $Format.Trim().TrimStart(".").ToLowerInvariant()
+}
+
+function Get-TargetExtension {
+    param([Parameter(Mandatory = $true)][string]$TargetFormat)
+
+    switch (Get-NormalizedFormat $TargetFormat) {
+        "xlsx" { return "xlsx" }
+        "csv" { return "csv" }
+        "json" { return "json" }
+        "yaml" { return "yaml" }
+        "yml" { return "yaml" }
+        "xml" { return "xml" }
+        default { throw "Unsupported target format: $TargetFormat" }
+    }
+}
+
+function Resolve-OutputFilePath {
     param(
         [Parameter(Mandatory = $true)][string]$InputFile,
-        [Parameter(Mandatory = $true)][string]$TargetExtension,
-        [string]$OutputFile
+        [Parameter(Mandatory = $true)][string]$TargetFormat,
+        [string]$OutputFile,
+        [bool]$Force
     )
 
-    if (![string]::IsNullOrWhiteSpace($OutputFile)) {
-        return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputFile)
+    $Extension = Get-TargetExtension $TargetFormat
+
+    if ([string]::IsNullOrWhiteSpace($OutputFile)) {
+        $Directory = Split-Path -Path $InputFile
+        $FileName = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
+        $OutputFile = Join-Path $Directory "$FileName.$Extension"
+    }
+    else {
+        $OutputFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputFile)
     }
 
-    $Directory = Split-Path -Path $InputFile
-    $FileName = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
-    return (Join-Path $Directory "$FileName$TargetExtension")
+    $OutputDirectory = Split-Path -Path $OutputFile
+
+    if (![string]::IsNullOrWhiteSpace($OutputDirectory) -and !(Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
+        throw "Output directory does not exist: $OutputDirectory"
+    }
+
+    if ((Test-Path -LiteralPath $OutputFile) -and !$Force) {
+        throw "Output file already exists: $OutputFile. Use --force to overwrite it."
+    }
+
+    return $OutputFile
+}
+
+function Read-OptionValue {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][ref]$Index,
+        [Parameter(Mandatory = $true)][string]$Option
+    )
+
+    if ($Index.Value + 1 -ge $Arguments.Count -or $Arguments[$Index.Value + 1].StartsWith("--")) {
+        throw "Missing value for option: $Option"
+    }
+
+    $Index.Value++
+    return $Arguments[$Index.Value]
+}
+
+function ConvertFrom-ConvertArguments {
+    param([string[]]$Arguments)
+
+    $Result = [ordered]@{
+        InputFile = $null
+        SourceFormat = $null
+        TargetFormat = $null
+        OutputFile = $null
+        Force = $false
+        Help = $false
+    }
+
+    if ($null -eq $Arguments -or $Arguments.Count -eq 0) {
+        return [pscustomobject]$Result
+    }
+
+    for ($Index = 0; $Index -lt $Arguments.Count; $Index++) {
+        $Argument = $Arguments[$Index]
+
+        if ($Argument -eq "--help" -or $Argument -eq "-h") {
+            $Result.Help = $true
+            continue
+        }
+
+        if ($Argument -eq "--to") {
+            $Result.TargetFormat = Read-OptionValue -Arguments $Arguments -Index ([ref]$Index) -Option $Argument
+            continue
+        }
+
+        if ($Argument -eq "--from") {
+            $Result.SourceFormat = Read-OptionValue -Arguments $Arguments -Index ([ref]$Index) -Option $Argument
+            continue
+        }
+
+        if ($Argument -eq "--output") {
+            $Result.OutputFile = Read-OptionValue -Arguments $Arguments -Index ([ref]$Index) -Option $Argument
+            continue
+        }
+
+        if ($Argument -eq "--force") {
+            $Result.Force = $true
+            continue
+        }
+
+        if ($Argument.StartsWith("--")) {
+            throw "Unknown option: $Argument"
+        }
+
+        if ($null -ne $Result.InputFile) {
+            throw "Unexpected argument: $Argument"
+        }
+
+        $Result.InputFile = $Argument
+    }
+
+    return [pscustomobject]$Result
+}
+
+function Resolve-SourceFormat {
+    param(
+        [Parameter(Mandatory = $true)][string]$InputFile,
+        [string]$ExplicitSourceFormat
+    )
+
+    if (![string]::IsNullOrWhiteSpace($ExplicitSourceFormat)) {
+        return (Get-NormalizedFormat $ExplicitSourceFormat)
+    }
+
+    $Extension = [System.IO.Path]::GetExtension($InputFile)
+
+    if ([string]::IsNullOrWhiteSpace($Extension)) {
+        throw "Unable to infer source format because the input file has no extension. Use --from <format>."
+    }
+
+    $Format = Get-NormalizedFormat $Extension
+
+    if ($Format -eq "txt") {
+        throw "Ambiguous source extension '.txt'. Use --from <format>, for example --from csv."
+    }
+
+    return $Format
 }
 
 function Get-ConversionMap {
-    return [ordered]@{
-        ".csv->to-xlsx" = @{
-            Source = ".csv"; TargetFormat = "to-xlsx"; TargetExtension = ".xlsx"; Description = ".csv        -> .xlsx"
-            Converter = { param($Source, $Destination) Convert-CsvToXlsx -InputFile $Source -OutputFile $Destination }
-        }
-        ".xlsx->to-csv" = @{
-            Source = ".xlsx"; TargetFormat = "to-csv"; TargetExtension = ".csv"; Description = ".xlsx       -> .csv"
-            Converter = { param($Source, $Destination) Convert-XlsxToCsv -InputFile $Source -OutputFile $Destination }
-        }
-        ".csv->to-json" = @{
-            Source = ".csv"; TargetFormat = "to-json"; TargetExtension = ".json"; Description = ".csv        -> .json"
-            Converter = { param($Source, $Destination) Convert-CsvToJson -InputFile $Source -OutputFile $Destination }
-        }
-        ".json->to-csv" = @{
-            Source = ".json"; TargetFormat = "to-csv"; TargetExtension = ".csv"; Description = ".json       -> .csv"
-            Converter = { param($Source, $Destination) Convert-JsonToCsv -InputFile $Source -OutputFile $Destination }
-        }
-        ".json->to-yaml" = @{
-            Source = ".json"; TargetFormat = "to-yaml"; TargetExtension = ".yaml"; Description = ".json       -> .yaml"
-            Converter = { param($Source, $Destination) Convert-JsonToYaml -InputFile $Source -OutputFile $Destination }
-        }
-        ".yaml->to-json" = @{
-            Source = ".yaml"; TargetFormat = "to-json"; TargetExtension = ".json"; Description = ".yaml/.yml  -> .json"
-            Converter = { param($Source, $Destination) Convert-YamlToJson -InputFile $Source -OutputFile $Destination }
-        }
-        ".yml->to-json" = @{
-            Source = ".yml"; TargetFormat = "to-json"; TargetExtension = ".json"; Description = ".yaml/.yml  -> .json"
-            Converter = { param($Source, $Destination) Convert-YamlToJson -InputFile $Source -OutputFile $Destination }
-        }
-        ".xml->to-json" = @{
-            Source = ".xml"; TargetFormat = "to-json"; TargetExtension = ".json"; Description = ".xml        -> .json"
-            Converter = { param($Source, $Destination) Convert-XmlToJson -InputFile $Source -OutputFile $Destination }
-        }
-        ".json->to-xml" = @{
-            Source = ".json"; TargetFormat = "to-xml"; TargetExtension = ".xml"; Description = ".json       -> .xml"
-            Converter = { param($Source, $Destination) Convert-JsonToXml -InputFile $Source -OutputFile $Destination }
-        }
-        ".properties->to-yaml" = @{
-            Source = ".properties"; TargetFormat = "to-yaml"; TargetExtension = ".yaml"; Description = ".properties -> .yaml"
-            Converter = { param($Source, $Destination) Convert-PropertiesToYaml -InputFile $Source -OutputFile $Destination }
-        }
-        ".yaml->to-properties" = @{
-            Source = ".yaml"; TargetFormat = "to-properties"; TargetExtension = ".properties"; Description = ".yaml/.yml  -> .properties"
-            Converter = { param($Source, $Destination) Convert-YamlToProperties -InputFile $Source -OutputFile $Destination }
-        }
-        ".yml->to-properties" = @{
-            Source = ".yml"; TargetFormat = "to-properties"; TargetExtension = ".properties"; Description = ".yaml/.yml  -> .properties"
-            Converter = { param($Source, $Destination) Convert-YamlToProperties -InputFile $Source -OutputFile $Destination }
-        }
+    return @{
+        "csv->xlsx" = { param($Source, $Destination) Convert-CsvToXlsx -InputFile $Source -OutputFile $Destination }
+        "xlsx->csv" = { param($Source, $Destination) Convert-XlsxToCsv -InputFile $Source -OutputFile $Destination }
+        "csv->json" = { param($Source, $Destination) Convert-CsvToJson -InputFile $Source -OutputFile $Destination }
+        "json->csv" = { param($Source, $Destination) Convert-JsonToCsv -InputFile $Source -OutputFile $Destination }
+        "json->yaml" = { param($Source, $Destination) Convert-JsonToYaml -InputFile $Source -OutputFile $Destination }
+        "yaml->json" = { param($Source, $Destination) Convert-YamlToJson -InputFile $Source -OutputFile $Destination }
+        "yml->json" = { param($Source, $Destination) Convert-YamlToJson -InputFile $Source -OutputFile $Destination }
+        "xml->json" = { param($Source, $Destination) Convert-XmlToJson -InputFile $Source -OutputFile $Destination }
+        "json->xml" = { param($Source, $Destination) Convert-JsonToXml -InputFile $Source -OutputFile $Destination }
     }
 }
 
-function Get-SupportedConversions {
-    return (Get-ConversionMap).Values | ForEach-Object { $_["Description"] } | Select-Object -Unique
+function Test-SupportedFormat {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceFormat,
+        [Parameter(Mandatory = $true)][string]$TargetFormat
+    )
+
+    $SupportedSources = @("csv", "xlsx", "json", "yaml", "yml", "xml")
+    $SupportedTargets = @("xlsx", "csv", "json", "yaml", "yml", "xml")
+
+    if ($SourceFormat -notin $SupportedSources) {
+        throw "Unsupported source format: $SourceFormat. Supported sources: $($SupportedSources -join ', ')."
+    }
+
+    if ($TargetFormat -notin $SupportedTargets) {
+        throw "Unsupported target format: $TargetFormat. Supported targets: $($SupportedTargets -join ', ')."
+    }
+}
+
+function Read-CsvRows {
+    param([Parameter(Mandatory = $true)][string]$InputFile)
+
+    $Rows = Import-Csv -LiteralPath $InputFile
+
+    if ($null -eq $Rows -or $Rows.Count -eq 0) {
+        throw "CSV file contains no data rows."
+    }
+
+    return @($Rows)
+}
+
+function Read-JsonDocument {
+    param([Parameter(Mandatory = $true)][string]$InputFile)
+
+    $Content = Get-Content -LiteralPath $InputFile -Raw -Encoding UTF8
+
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        throw "JSON file contains no data."
+    }
+
+    try {
+        $Parsed = $Content | ConvertFrom-Json
+
+        if ($Content.TrimStart().StartsWith("[") -and $Parsed -isnot [System.Collections.IList]) {
+            return ,@($Parsed)
+        }
+
+        return $Parsed
+    }
+    catch {
+        throw "Invalid JSON content: $($_.Exception.Message)"
+    }
+}
+
+function Read-YamlDocument {
+    param([Parameter(Mandatory = $true)][string]$InputFile)
+
+    Test-YamlDependency
+    $Content = Get-Content -LiteralPath $InputFile -Raw -Encoding UTF8
+
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        throw "YAML file contains no data."
+    }
+
+    try {
+        return (ConvertFrom-Yaml -Yaml $Content)
+    }
+    catch {
+        throw "Invalid YAML content: $($_.Exception.Message)"
+    }
+}
+
+function Write-JsonDocument {
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][string]$OutputFile
+    )
+
+    $Value | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $OutputFile -Encoding UTF8
+}
+
+function Write-YamlDocument {
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][string]$OutputFile
+    )
+
+    Test-YamlDependency
+    $Value | ConvertTo-Yaml | Set-Content -LiteralPath $OutputFile -Encoding UTF8
 }
 
 function ConvertTo-PlainObject {
@@ -132,185 +331,39 @@ function ConvertTo-PlainObject {
     return $Value
 }
 
-function ConvertTo-YamlScalar {
-    param([AllowNull()]$Value)
+function Test-FlatObjectArray {
+    param([Parameter(Mandatory = $true)]$Value)
 
-    if ($null -eq $Value) { return "null" }
-    if ($Value -is [bool]) { return $Value.ToString().ToLowerInvariant() }
-    if ($Value -is [int] -or $Value -is [long] -or $Value -is [decimal] -or $Value -is [double]) {
-        return $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    if ($Value -is [pscustomobject] -or $Value -is [System.Collections.IDictionary]) {
+        $Rows = @($Value)
+    }
+    elseif ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $Rows = @($Value)
+    }
+    else {
+        throw "JSON to CSV supports arrays of flat objects only."
     }
 
-    $Text = [string]$Value
-    if ($Text -eq "") { return "''" }
-
-    if ($Text -match "[:#\[\]\{\},&\*!|>'`"%@]" -or $Text.Trim() -ne $Text -or $Text -match "^(true|false|null|[-+]?\d+(\.\d+)?)$") {
-        return "'" + $Text.Replace("'", "''") + "'"
+    if ($Rows.Count -eq 0) {
+        throw "JSON array contains no rows."
     }
 
-    return $Text
-}
+    foreach ($Row in $Rows) {
+        if ($Row -isnot [pscustomobject] -and $Row -isnot [System.Collections.IDictionary]) {
+            throw "JSON to CSV supports arrays of flat objects only."
+        }
 
-function ConvertTo-SimpleYamlLines {
-    param([AllowNull()]$Value, [int]$Indent = 0)
+        $PlainRow = ConvertTo-PlainObject $Row
 
-    $Padding = " " * $Indent
-    $Value = ConvertTo-PlainObject $Value
-    $Lines = @()
-
-    if ($Value -is [System.Collections.IDictionary]) {
-        foreach ($Key in $Value.Keys) {
-            $Child = $Value[$Key]
-            if ($Child -is [System.Collections.IDictionary] -or ($Child -is [System.Collections.IEnumerable] -and $Child -isnot [string])) {
-                $Lines += "$Padding${Key}:"
-                $Lines += ConvertTo-SimpleYamlLines -Value $Child -Indent ($Indent + 2)
-            }
-            else {
-                $Lines += "$Padding${Key}: $(ConvertTo-YamlScalar $Child)"
+        foreach ($Key in $PlainRow.Keys) {
+            $CellValue = $PlainRow[$Key]
+            if ($CellValue -is [System.Collections.IDictionary] -or ($CellValue -is [System.Collections.IEnumerable] -and $CellValue -isnot [string])) {
+                throw "JSON to CSV does not support nested property '$Key'. Use a flat array of objects."
             }
         }
-        return $Lines
     }
 
-    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
-        foreach ($Item in $Value) {
-            if ($Item -is [System.Collections.IDictionary] -or ($Item -is [System.Collections.IEnumerable] -and $Item -isnot [string])) {
-                $Lines += "$Padding-"
-                $Lines += ConvertTo-SimpleYamlLines -Value $Item -Indent ($Indent + 2)
-            }
-            else {
-                $Lines += "$Padding- $(ConvertTo-YamlScalar $Item)"
-            }
-        }
-        return $Lines
-    }
-
-    return @("$Padding$(ConvertTo-YamlScalar $Value)")
-}
-
-function ConvertFrom-YamlScalar {
-    param([string]$Value)
-
-    $Value = $Value.Trim()
-    if ($Value -eq "" -or $Value -eq "null" -or $Value -eq "~") { return $null }
-    if ($Value -eq "true") { return $true }
-    if ($Value -eq "false") { return $false }
-
-    if (($Value.StartsWith("'") -and $Value.EndsWith("'")) -or ($Value.StartsWith('"') -and $Value.EndsWith('"'))) {
-        return $Value.Substring(1, $Value.Length - 2).Replace("''", "'")
-    }
-
-    $Number = 0.0
-    if ([double]::TryParse($Value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Number)) {
-        return $Number
-    }
-
-    return $Value
-}
-
-function ConvertFrom-SimpleYaml {
-    param([Parameter(Mandatory = $true)][string[]]$Lines)
-
-    $Root = [ordered]@{}
-    $Stack = @(@{ Indent = -1; Value = $Root })
-
-    foreach ($Line in $Lines) {
-        if ([string]::IsNullOrWhiteSpace($Line) -or $Line.TrimStart().StartsWith("#")) { continue }
-
-        $Indent = $Line.Length - $Line.TrimStart().Length
-        $Text = $Line.Trim()
-
-        while ($Stack.Count -gt 1 -and $Indent -le $Stack[-1].Indent) {
-            $Stack = $Stack[0..($Stack.Count - 2)]
-        }
-
-        $Parent = $Stack[-1].Value
-
-        if ($Text.StartsWith("- ")) {
-            throw "YAML list parsing is only supported inside named properties."
-        }
-
-        if ($Text -notmatch "^([^:]+):(.*)$") {
-            throw "Unsupported YAML line: $Line"
-        }
-
-        $Key = $Matches[1].Trim()
-        $RawValue = $Matches[2].Trim()
-
-        if ($RawValue -eq "") {
-            $Child = [ordered]@{}
-            $Parent[$Key] = $Child
-            $Stack += @{ Indent = $Indent; Value = $Child }
-        }
-        elseif ($RawValue.StartsWith("[") -and $RawValue.EndsWith("]")) {
-            $Items = $RawValue.Trim("[", "]").Split(",") |
-                Where-Object { $_.Trim() -ne "" } |
-                ForEach-Object { ConvertFrom-YamlScalar $_ }
-            $Parent[$Key] = @($Items)
-        }
-        else {
-            $Parent[$Key] = ConvertFrom-YamlScalar $RawValue
-        }
-    }
-
-    return $Root
-}
-
-function Read-JsonFile {
-    param([Parameter(Mandatory = $true)][string]$InputFile)
-
-    $Content = Get-Content -LiteralPath $InputFile -Raw
-    if ([string]::IsNullOrWhiteSpace($Content)) {
-        throw "JSON file contains no data."
-    }
-
-    return ($Content | ConvertFrom-Json)
-}
-
-function Read-PropertiesFile {
-    param([Parameter(Mandatory = $true)][string]$InputFile)
-
-    $Properties = [ordered]@{}
-
-    foreach ($Line in Get-Content -LiteralPath $InputFile) {
-        $Trimmed = $Line.Trim()
-        if ($Trimmed -eq "" -or $Trimmed.StartsWith("#") -or $Trimmed.StartsWith("!")) { continue }
-
-        if ($Trimmed -notmatch "^([^:=\s]+)\s*[:=]\s*(.*)$") {
-            throw "Unsupported properties line: $Line"
-        }
-
-        $Properties[$Matches[1]] = $Matches[2]
-    }
-
-    if ($Properties.Count -eq 0) {
-        throw "Properties file contains no data."
-    }
-
-    return $Properties
-}
-
-function ConvertTo-PropertiesLines {
-    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Value, [string]$Prefix = "")
-
-    $Lines = @()
-
-    foreach ($Key in $Value.Keys) {
-        $Name = if ($Prefix) { "$Prefix.$Key" } else { $Key }
-        $Child = $Value[$Key]
-
-        if ($Child -is [System.Collections.IDictionary]) {
-            $Lines += ConvertTo-PropertiesLines -Value $Child -Prefix $Name
-        }
-        elseif ($Child -is [System.Collections.IEnumerable] -and $Child -isnot [string]) {
-            $Lines += "$Name=$($Child -join ',')"
-        }
-        else {
-            $Lines += "$Name=$Child"
-        }
-    }
-
-    return $Lines
+    return $Rows
 }
 
 function Convert-XmlNodeToObject {
@@ -329,8 +382,8 @@ function Convert-XmlNodeToObject {
     }
 
     foreach ($Child in $ElementChildren) {
-        $ChildValue = Convert-XmlNodeToObject $Child
         $ChildName = $Child.LocalName
+        $ChildValue = Convert-XmlNodeToObject $Child
 
         if ($Result.Contains($ChildName)) {
             if ($Result[$ChildName] -isnot [System.Collections.IList]) {
@@ -380,20 +433,20 @@ function Add-JsonXmlElement {
     }
 }
 
-function Write-ConversionHeader {
-    param([string]$Label, [string]$InputFile, [string]$OutputFile)
+function Write-ConversionSummary {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceFormat,
+        [Parameter(Mandatory = $true)][string]$TargetFormat,
+        [Parameter(Mandatory = $true)][string]$InputFile,
+        [Parameter(Mandatory = $true)][string]$OutputFile
+    )
 
     Write-Host ""
-    Write-Host $Label
+    Write-Host "$($SourceFormat.ToUpperInvariant()) -> $($TargetFormat.ToUpperInvariant())"
     Write-Host "-----------------------------"
     Write-Host "Input : $InputFile"
     Write-Host "Output: $OutputFile"
     Write-Host ""
-}
-
-function Write-ConversionSuccess {
-    param([string]$OutputFile)
-
     Write-Host "Conversion completed successfully."
     Write-Host ""
     Write-Host $OutputFile
@@ -403,228 +456,172 @@ function Convert-CsvToXlsx {
     param([string]$InputFile, [string]$OutputFile)
 
     Test-ImportExcelDependency
-    Write-ConversionHeader -Label "CSV -> XLSX" -InputFile $InputFile -OutputFile $OutputFile
-
-    try {
-        $Data = Import-Csv -LiteralPath $InputFile
-        if ($null -eq $Data -or $Data.Count -eq 0) { throw "CSV file contains no data." }
-
-        $Data | Export-Excel -Path $OutputFile -WorksheetName "Data" -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow
-        Write-ConversionSuccess $OutputFile
-    }
-    catch {
-        throw "CSV to XLSX conversion failed: $($_.Exception.Message)"
-    }
+    $Rows = Read-CsvRows $InputFile
+    $Rows | Export-Excel -Path $OutputFile -WorksheetName "Data" -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow
 }
 
 function Convert-XlsxToCsv {
     param([string]$InputFile, [string]$OutputFile)
 
     Test-ImportExcelDependency
-    Write-ConversionHeader -Label "XLSX -> CSV" -InputFile $InputFile -OutputFile $OutputFile
+    $Rows = Import-Excel -Path $InputFile
 
-    try {
-        $Data = Import-Excel -Path $InputFile
-        if ($null -eq $Data -or $Data.Count -eq 0) { throw "XLSX file contains no data." }
+    if ($null -eq $Rows -or $Rows.Count -eq 0) {
+        throw "XLSX file contains no data rows."
+    }
 
-        $Data | Export-Csv -LiteralPath $OutputFile -NoTypeInformation
-        Write-ConversionSuccess $OutputFile
-    }
-    catch {
-        throw "XLSX to CSV conversion failed: $($_.Exception.Message)"
-    }
+    $Rows | Export-Csv -LiteralPath $OutputFile -NoTypeInformation -Encoding UTF8
 }
 
 function Convert-CsvToJson {
     param([string]$InputFile, [string]$OutputFile)
 
-    Write-ConversionHeader -Label "CSV -> JSON" -InputFile $InputFile -OutputFile $OutputFile
-
-    try {
-        $Data = Import-Csv -LiteralPath $InputFile
-        if ($null -eq $Data -or $Data.Count -eq 0) { throw "CSV file contains no data." }
-
-        $Data | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $OutputFile
-        Write-ConversionSuccess $OutputFile
-    }
-    catch {
-        throw "CSV to JSON conversion failed: $($_.Exception.Message)"
-    }
+    Write-JsonDocument -Value (Read-CsvRows $InputFile) -OutputFile $OutputFile
 }
 
 function Convert-JsonToCsv {
     param([string]$InputFile, [string]$OutputFile)
 
-    Write-ConversionHeader -Label "JSON -> CSV" -InputFile $InputFile -OutputFile $OutputFile
-
-    try {
-        $Data = Read-JsonFile $InputFile
-        if ($Data -isnot [System.Collections.IEnumerable] -or $Data -is [string]) { $Data = @($Data) }
-        if ($Data.Count -eq 0) { throw "JSON file contains no data." }
-
-        $Data | Export-Csv -LiteralPath $OutputFile -NoTypeInformation
-        Write-ConversionSuccess $OutputFile
-    }
-    catch {
-        throw "JSON to CSV conversion failed: $($_.Exception.Message)"
-    }
+    $Rows = Test-FlatObjectArray (Read-JsonDocument $InputFile)
+    $Rows | Export-Csv -LiteralPath $OutputFile -NoTypeInformation -Encoding UTF8
 }
 
 function Convert-JsonToYaml {
     param([string]$InputFile, [string]$OutputFile)
 
-    Write-ConversionHeader -Label "JSON -> YAML" -InputFile $InputFile -OutputFile $OutputFile
-
-    try {
-        $Data = Read-JsonFile $InputFile
-        ConvertTo-SimpleYamlLines $Data | Set-Content -LiteralPath $OutputFile
-        Write-ConversionSuccess $OutputFile
-    }
-    catch {
-        throw "JSON to YAML conversion failed: $($_.Exception.Message)"
-    }
+    Write-YamlDocument -Value (Read-JsonDocument $InputFile) -OutputFile $OutputFile
 }
 
 function Convert-YamlToJson {
     param([string]$InputFile, [string]$OutputFile)
 
-    Write-ConversionHeader -Label "YAML -> JSON" -InputFile $InputFile -OutputFile $OutputFile
-
-    try {
-        $Data = ConvertFrom-SimpleYaml -Lines (Get-Content -LiteralPath $InputFile)
-        if ($Data.Count -eq 0) { throw "YAML file contains no data." }
-
-        $Data | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $OutputFile
-        Write-ConversionSuccess $OutputFile
-    }
-    catch {
-        throw "YAML to JSON conversion failed: $($_.Exception.Message)"
-    }
+    Write-JsonDocument -Value (Read-YamlDocument $InputFile) -OutputFile $OutputFile
 }
 
 function Convert-XmlToJson {
     param([string]$InputFile, [string]$OutputFile)
 
-    Write-ConversionHeader -Label "XML -> JSON" -InputFile $InputFile -OutputFile $OutputFile
-
     try {
-        [xml]$Xml = Get-Content -LiteralPath $InputFile -Raw
-        $RootName = $Xml.DocumentElement.LocalName
-        $Data = [ordered]@{}
-        $Data[$RootName] = Convert-XmlNodeToObject $Xml.DocumentElement
-        $Data | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $OutputFile
-        Write-ConversionSuccess $OutputFile
+        [xml]$Xml = Get-Content -LiteralPath $InputFile -Raw -Encoding UTF8
     }
     catch {
-        throw "XML to JSON conversion failed: $($_.Exception.Message)"
+        throw "Invalid XML content: $($_.Exception.Message)"
     }
+
+    $RootName = $Xml.DocumentElement.LocalName
+    $Data = [ordered]@{}
+    $Data[$RootName] = Convert-XmlNodeToObject $Xml.DocumentElement
+    Write-JsonDocument -Value $Data -OutputFile $OutputFile
 }
 
 function Convert-JsonToXml {
     param([string]$InputFile, [string]$OutputFile)
 
-    Write-ConversionHeader -Label "JSON -> XML" -InputFile $InputFile -OutputFile $OutputFile
+    $Data = ConvertTo-PlainObject (Read-JsonDocument $InputFile)
+    $Xml = New-Object System.Xml.XmlDocument
+    $Declaration = $Xml.CreateXmlDeclaration("1.0", "utf-8", $null)
+    [void]$Xml.AppendChild($Declaration)
 
-    try {
-        $Data = ConvertTo-PlainObject (Read-JsonFile $InputFile)
-        $Xml = New-Object System.Xml.XmlDocument
-        $Declaration = $Xml.CreateXmlDeclaration("1.0", "utf-8", $null)
-        [void]$Xml.AppendChild($Declaration)
-
-        if ($Data -is [System.Collections.IDictionary] -and $Data.Count -eq 1) {
-            $RootName = @($Data.Keys)[0]
-            Add-JsonXmlElement -Document $Xml -Parent $Xml -Name $RootName -Value $Data[$RootName]
-        }
-        else {
-            Add-JsonXmlElement -Document $Xml -Parent $Xml -Name "root" -Value $Data
-        }
-
-        $Xml.Save($OutputFile)
-        Write-ConversionSuccess $OutputFile
+    if ($Data -is [System.Collections.IDictionary] -and $Data.Count -eq 1) {
+        $RootName = @($Data.Keys)[0]
+        Add-JsonXmlElement -Document $Xml -Parent $Xml -Name $RootName -Value $Data[$RootName]
     }
-    catch {
-        throw "JSON to XML conversion failed: $($_.Exception.Message)"
+    else {
+        Add-JsonXmlElement -Document $Xml -Parent $Xml -Name "root" -Value $Data
     }
-}
 
-function Convert-PropertiesToYaml {
-    param([string]$InputFile, [string]$OutputFile)
-
-    Write-ConversionHeader -Label "Properties -> YAML" -InputFile $InputFile -OutputFile $OutputFile
-
-    try {
-        $Data = Read-PropertiesFile $InputFile
-        ConvertTo-SimpleYamlLines $Data | Set-Content -LiteralPath $OutputFile
-        Write-ConversionSuccess $OutputFile
-    }
-    catch {
-        throw "Properties to YAML conversion failed: $($_.Exception.Message)"
-    }
-}
-
-function Convert-YamlToProperties {
-    param([string]$InputFile, [string]$OutputFile)
-
-    Write-ConversionHeader -Label "YAML -> Properties" -InputFile $InputFile -OutputFile $OutputFile
-
-    try {
-        $Data = ConvertFrom-SimpleYaml -Lines (Get-Content -LiteralPath $InputFile)
-        if ($Data.Count -eq 0) { throw "YAML file contains no data." }
-
-        ConvertTo-PropertiesLines -Value $Data | Set-Content -LiteralPath $OutputFile
-        Write-ConversionSuccess $OutputFile
-    }
-    catch {
-        throw "YAML to Properties conversion failed: $($_.Exception.Message)"
-    }
+    $Xml.Save($OutputFile)
 }
 
 function Invoke-FileConversion {
-    param(
-        [Parameter(Position = 0)][string]$TargetFormat,
-        [Parameter(Position = 1)][string]$InputFile,
-        [Parameter(Position = 2)][string]$OutputFile
-    )
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
 
-    if ([string]::IsNullOrWhiteSpace($TargetFormat)) {
-        throw "Missing target format. Use: devutils convert help"
+    $ParsedArguments = ConvertFrom-ConvertArguments $Arguments
+
+    if ($ParsedArguments.Help) {
+        Show-FileConversionHelp
+        return
     }
 
-    if ([string]::IsNullOrWhiteSpace($InputFile)) {
-        throw "Missing input file. Use: devutils convert $TargetFormat <input-file> [output-file]"
+    if ([string]::IsNullOrWhiteSpace($ParsedArguments.InputFile)) {
+        throw "Missing input file. Use: devutils convert <input> --to <target>"
     }
 
-    $TargetFormat = $TargetFormat.ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($ParsedArguments.TargetFormat)) {
+        throw "Missing required option: --to <target>"
+    }
+
+    $InputFile = Resolve-InputFilePath $ParsedArguments.InputFile
+    $SourceFormat = Resolve-SourceFormat -InputFile $InputFile -ExplicitSourceFormat $ParsedArguments.SourceFormat
+    $TargetFormat = Get-NormalizedFormat $ParsedArguments.TargetFormat
+
+    if ($TargetFormat -eq "yml") {
+        $TargetFormat = "yaml"
+    }
+
+    Test-SupportedFormat -SourceFormat $SourceFormat -TargetFormat $TargetFormat
+
+    $Route = "$SourceFormat->$TargetFormat"
     $Conversions = Get-ConversionMap
-    $SupportedTargetFormats = $Conversions.Values | ForEach-Object { $_["TargetFormat"] } | Select-Object -Unique
 
-    if ($TargetFormat -notin $SupportedTargetFormats) {
-        throw "Unsupported target format: $TargetFormat"
+    if (!$Conversions.ContainsKey($Route)) {
+        throw "Unsupported conversion: $SourceFormat -> $TargetFormat. Run 'devutils convert --help' for supported conversions."
     }
 
-    $InputFile = Resolve-InputFilePath -InputFile $InputFile
-    $SourceExtension = [System.IO.Path]::GetExtension($InputFile).ToLowerInvariant()
-    $SupportedSourceExtensions = $Conversions.Values | ForEach-Object { $_["Source"] } | Select-Object -Unique
-
-    if ($SourceExtension -notin $SupportedSourceExtensions) {
-        throw "Unsupported source extension: $SourceExtension"
-    }
-
-    $Route = "$SourceExtension->$TargetFormat"
-
-    if (!$Conversions.Contains($Route)) {
-        throw "Unsupported conversion: $Route"
-    }
-
-    $Conversion = $Conversions[$Route]
-    $OutputFile = New-OutputFilePath -InputFile $InputFile -TargetExtension $Conversion["TargetExtension"] -OutputFile $OutputFile
+    $OutputFile = Resolve-OutputFilePath `
+        -InputFile $InputFile `
+        -TargetFormat $TargetFormat `
+        -OutputFile $ParsedArguments.OutputFile `
+        -Force $ParsedArguments.Force
 
     try {
-        & $Conversion["Converter"] $InputFile $OutputFile
+        & $Conversions[$Route] $InputFile $OutputFile
+        Write-ConversionSummary -SourceFormat $SourceFormat -TargetFormat $TargetFormat -InputFile $InputFile -OutputFile $OutputFile
     }
     catch {
         throw "File conversion failed: $($_.Exception.Message)"
     }
+}
+
+function Show-FileConversionHelp {
+    Write-Host ""
+    Write-Host "File conversion commands:"
+    Write-Host "  devutils convert <input> --to <target> [--output <output>] [--force]"
+    Write-Host "  devutils convert <input> --from <source> --to <target> [--output <output>] [--force]"
+    Write-Host ""
+    Write-Host "Examples:"
+    Write-Host "  devutils convert data.csv --to xlsx"
+    Write-Host "  devutils convert data.xlsx --to csv"
+    Write-Host "  devutils convert data.csv --to json --output result.json"
+    Write-Host "  devutils convert data.txt --from csv --to json"
+    Write-Host ""
+    Write-Host "Options:"
+    Write-Host "  --to <target>       Required target format: xlsx, csv, json, yaml, xml"
+    Write-Host "  --from <source>     Optional source override: csv, xlsx, json, yaml, yml, xml"
+    Write-Host "  --output <file>     Optional output path. Defaults beside input with target extension."
+    Write-Host "  --force             Overwrite an existing output file."
+    Write-Host "  --help              Show this help."
+    Write-Host ""
+    Write-Host "Supported conversions:"
+    Write-Host "  csv  -> xlsx"
+    Write-Host "  xlsx -> csv"
+    Write-Host "  csv  -> json"
+    Write-Host "  json -> csv"
+    Write-Host "  json -> yaml"
+    Write-Host "  yaml -> json"
+    Write-Host "  xml  -> json"
+    Write-Host "  json -> xml"
+    Write-Host ""
+    Write-Host "Optional dependencies:"
+    Write-Host "  XLSX conversions require ImportExcel:"
+    Write-Host "    Install-Module ImportExcel -Scope CurrentUser"
+    Write-Host "  YAML conversions require powershell-yaml:"
+    Write-Host "    Install-Module powershell-yaml -Scope CurrentUser"
+    Write-Host ""
+    Write-Host "Limitations:"
+    Write-Host "  JSON -> CSV supports arrays of flat objects only."
+    Write-Host "  CSV values are text; type information is not inferred."
+    Write-Host "  XML/JSON mapping preserves elements and attributes as @attribute keys, but namespaces, ordering, comments, and some type information are not round-trip lossless."
 }
 
 Export-ModuleMember -Function Invoke-FileConversion

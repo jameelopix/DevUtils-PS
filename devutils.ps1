@@ -28,12 +28,7 @@ function Show-Help {
     Write-Host "  config  compare         Compare configuration files"
     Write-Host "  net     check           Check URL health"
     Write-Host "  git     compare         Compare Git branches"
-    Write-Host "  convert to-xlsx         Convert CSV to XLSX"
-    Write-Host "  convert to-csv          Convert XLSX to CSV"
-    Write-Host "  convert to-json         Convert CSV, YAML, or XML to JSON"
-    Write-Host "  convert to-yaml         Convert JSON or properties to YAML"
-    Write-Host "  convert to-xml          Convert JSON to XML"
-    Write-Host "  convert to-properties   Convert YAML to properties"
+    Write-Host "  convert <input>         Convert files between supported formats"
     Write-Host "  excel   date-format     Convert date formats in an XLSX column"
     Write-Host ""
     Write-Host "Examples:"
@@ -42,18 +37,17 @@ function Show-Help {
     Write-Host '  devutils config compare uat.properties prod.properties'
     Write-Host '  devutils net check urls.txt'
     Write-Host '  devutils git compare dev testing'
-    Write-Host '  devutils convert to-xlsx input.csv'
-    Write-Host '  devutils convert to-csv input.xlsx'
-    Write-Host '  devutils convert to-json input.csv'
-    Write-Host '  devutils convert to-yaml input.properties'
-    Write-Host '  devutils excel date-format report.xlsx Date dd/MM/yyyy yyyy-MM-dd'
+    Write-Host '  devutils convert data.csv --to xlsx'
+    Write-Host '  devutils convert data.csv --to json --output result.json'
+    Write-Host '  devutils convert data.txt --from csv --to json'
+    Write-Host '  devutils excel date-format --input-file report.xlsx --column Date --from-format dd/MM/yyyy --to-format yyyy-MM-dd'
     Write-Host ""
     Write-Host "  csv     to-xlsx         Convert CSV to XLSX"
     Write-Host '  devutils csv to-xlsx input.csv'
 }
 
 function Test-HelpCommand {
-    return ([string]::IsNullOrWhiteSpace($Command) -or $Command.ToLower() -eq "help")
+    return ([string]::IsNullOrWhiteSpace($Command) -or $Command.ToLower() -eq "help" -or $Command.ToLower() -eq "--help" -or $Command.ToLower() -eq "-h")
 }
 
 function Show-LogHelp {
@@ -87,26 +81,8 @@ function Show-GitHelp {
 }
 
 function Show-ConvertHelp {
-    Write-Host ""
-    Write-Host "Conversion commands:"
-    Write-Host "  devutils convert to-xlsx <input.csv> [output.xlsx]"
-    Write-Host "  devutils convert to-csv  <input.xlsx> [output.csv]"
-    Write-Host "  devutils convert to-json <input.csv|input.yaml|input.yml|input.xml> [output.json]"
-    Write-Host "  devutils convert to-yaml <input.json|input.properties> [output.yaml]"
-    Write-Host "  devutils convert to-xml <input.json> [output.xml]"
-    Write-Host "  devutils convert to-properties <input.yaml|input.yml> [output.properties]"
-    Write-Host ""
-    Write-Host "Supported conversions:"
-    Write-Host "  .csv        -> .xlsx"
-    Write-Host "  .xlsx       -> .csv"
-    Write-Host "  .csv        -> .json"
-    Write-Host "  .json       -> .csv"
-    Write-Host "  .json       -> .yaml"
-    Write-Host "  .yaml/.yml  -> .json"
-    Write-Host "  .xml        -> .json"
-    Write-Host "  .json       -> .xml"
-    Write-Host "  .properties -> .yaml"
-    Write-Host "  .yaml/.yml  -> .properties"
+    Import-Module (Join-Path $ModulePath "ConvertTools.psm1") -Force
+    Invoke-FileConversion -Arguments @("--help")
 }
 
 function Show-CsvHelp {
@@ -237,12 +213,22 @@ try {
         "convert" {
             Import-Module (Join-Path $ModulePath "ConvertTools.psm1") -Force
 
-            if (Test-HelpCommand) {
-                Show-ConvertHelp
+            if ($Command -and ($Command.ToLower() -eq "help" -or $Command.ToLower() -eq "--help" -or $Command.ToLower() -eq "-h")) {
+                Invoke-FileConversion -Arguments @("--help")
                 exit 0
             }
 
-            Invoke-FileConversion $Command @Arguments
+            $ConvertArguments = @()
+
+            if (![string]::IsNullOrWhiteSpace($Command)) {
+                $ConvertArguments += $Command
+            }
+
+            if ($null -ne $Arguments) {
+                $ConvertArguments += @($Arguments | Where-Object { $null -ne $_ -and $_ -ne "" })
+            }
+
+            Invoke-FileConversion -Arguments $ConvertArguments
         }
 
         "csv" {
